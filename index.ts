@@ -5,7 +5,6 @@ import { configDotenv } from "dotenv";
 import { createClient } from "redis";
 import WebSocket from "ws";
 
-
 // Initialize configuration and express app
 configDotenv();
 
@@ -549,14 +548,9 @@ async function fetchAllCurrencyPairs() {
     });
 
     for (const pair of validPairs) {
-      await ensureTableExists(
-        `ticks_${pair.currpair.toLowerCase()}_bid`,
-        "BID"
-      );
-      await ensureTableExists(
-        `ticks_${pair.currpair.toLowerCase()}_ask`,
-        "ASK"
-      );
+      await ensureTableExists(`ticks_${pair.currpair.toLowerCase()}_bid`);
+      await ensureTableExists(`ticks_${pair.currpair.toLowerCase()}_ask`);
+      await ensureCandleTableExists(`candles_${pair.currpair.toLowerCase()}_bid`);
     }
   } catch (error) {
     console.error("Error fetching currency pairs:", error);
@@ -565,7 +559,6 @@ async function fetchAllCurrencyPairs() {
 
 async function ensureTableExists(
   tableName: string,
-  type: "BID" | "ASK"
 ): Promise<void> {
   try {
     const tableCheck = await pgPool.query(
@@ -767,7 +760,7 @@ marketDataQueue.process(5, async (job) => {
       tableName = `ticks_${symbolLower}_ask`;
     }
 
-    await ensureTableExists(tableName, data.type);
+    await ensureTableExists(tableName);
 
     console.log(`Processing tick - Symbol: ${data.symbol}, Type: ${data.type}, Price: ${data.price}, Lots: ${lots}, Time: ${ticktime}`);
 
@@ -948,44 +941,6 @@ candleProcessingQueue.process(async (job) => {
 });
 
 
-// Helper Functions
-async function getContractSize(symbol: string): Promise<number> {
-  try {
-    const pairInfo = availableCurrencyPairs.find(
-      (pair) => pair.currpair === symbol
-    );
-
-    if (pairInfo && pairInfo.contractsize !== null) {
-      return parseFloat(pairInfo.contractsize.toString());
-    } else {
-      // Try to get the contract size directly from the database as a fallback
-      try {
-        const result = await pgPool.query(
-          "SELECT contractsize FROM currpairdetails WHERE currpair = $1",
-          [symbol]
-        );
-
-        if (result.rows.length > 0 && result.rows[0].contractsize !== null) {
-          return parseFloat(result.rows[0].contractsize.toString());
-        }
-      } catch (dbError) {
-        console.error(`Database lookup for contract size failed:`, dbError);
-      }
-
-      throw new Error(
-        `Cannot process data for ${symbol}: No valid contract size found`
-      );
-    }
-  } catch (error) {
-    console.error(`Error getting contract size for ${symbol}:`, error);
-    throw new Error(`Cannot process market data: ${error.message}`);
-  }
-}
-
-function calculateLots(quantity: number, contractSize: number): number {
-  return Math.round(quantity / contractSize);
-}
-
 // Redis Functions
 function setupRedisHealthCheck() {
   const HEALTH_CHECK_INTERVAL = 30000;
@@ -1018,7 +973,6 @@ function setupRedisHealthCheck() {
   }, HEALTH_CHECK_INTERVAL);
 }
 
-// Application Initialization
 async function initializeApplication() {
   try {
     // Connect to Redis
@@ -1030,7 +984,7 @@ async function initializeApplication() {
     await initDatabase();
 
     // Initialize WebSocket connection
-    // initializeWebSocket();
+    initializeWebSocket();
 
   } catch (error) {
     console.error("Application initialization failed:", error);
