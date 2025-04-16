@@ -6,17 +6,11 @@ import candlesLogger from "./logger";
 
 configDotenv();
 
-const CENTROID_HOST = process.env.CENTROID_PG_HOST;
-const CENTROID_PORT = process.env.CENTROID_PG_PORT ? Number(process.env.CENTROID_PG_PORT) : 5432;
-const CENTROID_USER = process.env.CENTROID_PG_USER;
-const CENTROID_PASSWORD = process.env.CENTROID_PG_PASSWORD;
-const CENTROID_DATABASE = process.env.CENTROID_PG_DATABASE;
-
-const LPPIME_HOST = process.env.PG_HOST;
-const LPPIME_PORT = process.env.PG_PORT ? Number(process.env.PG_PORT) : 5432;
-const LPPIME_USER = process.env.PG_USER;
-const LPPIME_PASSWORD = process.env.PG_PASSWORD;
-const LPPIME_DATABASE = process.env.PG_DATABASE;
+const CENTROID_HOST = process.env.PG_HOST;
+const CENTROID_PORT = process.env.PG_PORT ? Number(process.env.PG_PORT) : 5432;
+const CENTROID_USER = process.env.PG_USER;
+const CENTROID_PASSWORD = process.env.PG_PASSWORD;
+const CENTROID_DATABASE = process.env.PG_DATABASE;
 
 const REDIS_HOST = process.env.REDIS_HOST || "3.82.229.23";
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379");
@@ -51,18 +45,10 @@ const centroidPool = new Pool({
   max: 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
+  allowExitOnIdle: true,
+  maxUses: 1000, 
 });
 
-const lppimePool = new Pool({
-  host: LPPIME_HOST,
-  port: LPPIME_PORT,
-  user: LPPIME_USER,
-  password: LPPIME_PASSWORD,
-  database: LPPIME_DATABASE,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-});
 
 // Bull Queues
 const marketDataQueue = new Bull("marketData", {
@@ -120,7 +106,7 @@ async function pgListener() {
   client.on("notification", async (msg) => {
     if (msg.channel === 'tick') {
       try {
-        candlesLogger.info(`Received notification from Centroid: ${msg.payload}`);       
+        // candlesLogger.info(`Received notification from Centroid: ${msg.payload}`);       
         const [symbol, lotsStr, bora, priceStr, timestampStr] = (msg.payload ?? "").split(" ");
         const lots = parseInt(lotsStr);
         const price = parseFloat(priceStr);
@@ -145,7 +131,7 @@ async function pgListener() {
           type: bora === "A" ? "ASK" : "BID"
         };
 
-        candlesLogger.info(`Processing tick data from Centroid: ${JSON.stringify(tickData)}`);
+        // candlesLogger.info(`Processing tick data from Centroid: ${JSON.stringify(tickData)}`);
         processMarketData(tickData);
       } catch (error: any) {
         console.error("Error parsing notification payload from Centroid:", error);
@@ -174,7 +160,7 @@ async function initDatabase() {
 
 async function fetchAllCurrencyPairs() {
   try {
-    const result = await lppimePool.query(
+    const result = await centroidPool.query(
       "SELECT currpair, contractsize FROM currpairdetails"
     );
     availableCurrencyPairs = result.rows;
@@ -208,7 +194,7 @@ async function fetchAllCurrencyPairs() {
 
 async function ensureTableExists(tableName: string): Promise<void> {
   try {
-    const tableCheck = await lppimePool.query(
+    const tableCheck = await centroidPool.query(
       `SELECT EXISTS (
         SELECT FROM information_schema.tables
         WHERE table_schema = 'public'
@@ -218,11 +204,12 @@ async function ensureTableExists(tableName: string): Promise<void> {
     );
 
     if (!tableCheck.rows[0].exists) {
-      await lppimePool.query(`
+      await centroidPool.query(`
         CREATE TABLE ${tableName} (
           ticktime TIMESTAMP WITH TIME ZONE NOT NULL,
-          lots INTEGER PRIMARY KEY,
-          price NUMERIC NOT NULL
+          lots INTEGER,
+          price NUMERIC NOT NULL,
+          PRIMARY KEY (lots, ticktime)
         )
       `);
       candlesLogger.info(`Created table ${tableName} in Lppime`);
@@ -236,7 +223,7 @@ async function ensureTableExists(tableName: string): Promise<void> {
 
 async function ensureCandleTableExists(tableName: string): Promise<void> {
   try {
-    const tableCheck = await lppimePool.query(
+    const tableCheck = await centroidPool.query(
       `SELECT EXISTS (
         SELECT FROM information_schema.tables
         WHERE table_schema = 'public'
@@ -246,7 +233,7 @@ async function ensureCandleTableExists(tableName: string): Promise<void> {
     );
 
     if (!tableCheck.rows[0].exists) {
-      await lppimePool.query(`
+      await centroidPool.query(`
         CREATE TABLE ${tableName} (
           candlesize TEXT NOT NULL,
           lots SMALLINT NOT NULL,
@@ -300,13 +287,12 @@ marketDataQueue.process(5, async (job) => {
     }
 
 
-    const insertQuery = await lppimePool.query({
+    const insertQuery = await centroidPool.query({
       text: `
         INSERT INTO ${tableName} 
         (ticktime, lots, price)
         VALUES ($1, $2, $3)
-        ON CONFLICT (lots) DO NOTHING
-        RETURNING *;
+
       `,
       values: [
         ticktime.toISOString(),
@@ -347,7 +333,7 @@ async function processTickForCandles(tickData: TickData) {
     await candleProcessingQueue.add(
       {
         tickData,
-        timeFrames: Object.keys(timeFrames),
+        timeFrames: timeFrames,
       },
       {
         jobId,
@@ -368,7 +354,6 @@ candleProcessingQueue.process(async (job) => {
     throw new Error("Invalid job data");
   }
 
-
   const lots = 1;
   const tableName = `candles_${symbol.toLowerCase()}_bid`;
 
@@ -379,25 +364,14 @@ candleProcessingQueue.process(async (job) => {
   if (timestamp instanceof Date && !isNaN(timestamp.getTime())) {
     processedTimestamp = timestamp;
   } else if (typeof timestamp === 'string' || typeof timestamp === 'number') {
-    // Try parsing as milliseconds first
     processedTimestamp = new Date(timestamp);
-
-    // If invalid, try parsing as seconds (common Unix timestamp format)
     if (isNaN(processedTimestamp.getTime())) {
       const numTimestamp = Number(timestamp);
-      if (!isNaN(numTimestamp)) {
-        processedTimestamp = new Date(
-          numTimestamp > 1000000000000 ? numTimestamp : numTimestamp * 1000
-        );
-      }
-    }
-
-    if (isNaN(processedTimestamp.getTime())) {
-      candlesLogger.warn(`Invalid timestamp ${timestamp} for ${symbol}, using current time`);
-      processedTimestamp = new Date();
+      processedTimestamp = new Date(
+        numTimestamp > 1000000000000 ? numTimestamp : numTimestamp * 1000
+      );
     }
   } else {
-    candlesLogger.warn(`Unexpected timestamp type for ${symbol}, using current time`);
     processedTimestamp = new Date();
   }
 
@@ -405,14 +379,10 @@ candleProcessingQueue.process(async (job) => {
     processedTimestamp = new Date();
   }
 
-
-
-  for (const [timeframe, duration] of Object.entries(timeFrames) as [string, number][]) {
+  // Process each timeframe
+  for (const timeframe of Object.keys(timeFrames)) {
     try {
-
-      if (isNaN(processedTimestamp.getTime())) {
-        throw new Error(`Invalid processed timestamp for ${symbol}: ${processedTimestamp}`);
-      }
+      const duration = timeFrames[timeframe];
 
       if (!duration || isNaN(duration) || duration <= 0) {
         candlesLogger.error(`Invalid duration ${duration} for timeframe ${timeframe}`);
@@ -427,8 +397,8 @@ candleProcessingQueue.process(async (job) => {
         throw new Error(`Invalid candle time calculation for ${symbol} ${timeframe}`);
       }
 
-
-      const existingCandle = await lppimePool.query({
+      // Check if candle exists
+      const existingCandle = await centroidPool.query({
         text: `
           SELECT * FROM ${tableName}
           WHERE candlesize = $1 AND lots = $2 AND candletime = $3
@@ -437,8 +407,8 @@ candleProcessingQueue.process(async (job) => {
       });
 
       if (existingCandle.rows.length > 0) {
-
-        const updateResult = await lppimePool.query({
+        // Update existing candle
+        const updateResult = await centroidPool.query({
           text: `
             UPDATE ${tableName}
             SET high = GREATEST(high, $1),
@@ -460,7 +430,8 @@ candleProcessingQueue.process(async (job) => {
         });
         candlesLogger.info(`Updated candle for ${symbol} in ${timeframe}`, updateResult.rows[0]);
       } else {
-        const insertResult = await lppimePool.query({
+        // Create new candle
+        const insertResult = await centroidPool.query({
           text: `
             INSERT INTO ${tableName}
             (candlesize, lots, candletime, open, high, low, close)
@@ -477,7 +448,6 @@ candleProcessingQueue.process(async (job) => {
             price, // close
           ],
         });
-
         candlesLogger.info(`Created new candle for ${symbol} in ${timeframe}`, insertResult.rows[0]);
       }
     } catch (error) {
@@ -531,7 +501,6 @@ process.on("SIGINT", async () => {
     await candleProcessingQueue.close();
 
     await centroidPool.end();
-    await lppimePool.end();
     process.exit(0);
   } catch (error) {
     console.error("Error during shutdown:", error);
