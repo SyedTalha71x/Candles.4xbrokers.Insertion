@@ -1,10 +1,18 @@
 import pkg from "pg";
 const { Pool } = pkg;
-import Bull from "bull";
 import { configDotenv } from "dotenv";
 import candlesLogger from "./logger";
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
 
 configDotenv();
+
+const redisConnection = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379', {
+  maxRetriesPerRequest: null
+});
+
+export const tickQueue = new Queue('tickQueue', { connection: redisConnection });
+export const candleQueue = new Queue('candleQueue', { connection: redisConnection });
 
 const CENTROID_HOST = process.env.PG_HOST;
 const CENTROID_PORT = process.env.PG_PORT ? Number(process.env.PG_PORT) : 5432;
@@ -12,17 +20,10 @@ const CENTROID_USER = process.env.PG_USER;
 const CENTROID_PASSWORD = process.env.PG_PASSWORD;
 const CENTROID_DATABASE = process.env.PG_DATABASE;
 
-const REDIS_HOST = process.env.REDIS_HOST || "3.82.229.23";
-const REDIS_PORT = parseInt(process.env.REDIS_PORT || "6379");
-const REDIS_PASSWORD = process.env.REDIS_PASSWORD;
 
-const timeFrames: Record<string, number> = {
-  M1: 60000,
-  H1: 3600000,
-  D1: 86400000,
-};
+let isShuttingDown = false;
 
-// Interfaces
+
 interface TickData {
   symbol: string;
   price: number;
@@ -42,110 +43,78 @@ const centroidPool = new Pool({
   user: CENTROID_USER,
   password: CENTROID_PASSWORD,
   database: CENTROID_DATABASE,
-  max: 5,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
+  max: 30,
+  idleTimeoutMillis: 60000,
+  connectionTimeoutMillis: 60000,
   allowExitOnIdle: true,
-  maxUses: 1000, 
+  maxUses: 1000,
 });
 
 
-// Bull Queues
-const marketDataQueue = new Bull("marketData", {
-  redis: {
-    host: REDIS_HOST,
-    port: REDIS_PORT,
-    password: REDIS_PASSWORD,
-  },
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: {
-      type: "exponential",
-      delay: 1000,
-    },
-    removeOnComplete: true,
-    timeout: 30000,
-  },
-  limiter: {
-    max: 100,
-    duration: 1000,
-  },
-  settings: {
-    maxStalledCount: 1,
-  },
-});
 
-const candleProcessingQueue = new Bull("candleProcessing", {
-  redis: {
-    host: REDIS_HOST,
-    port: REDIS_PORT,
-    password: REDIS_PASSWORD,
-  },
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: {
-      type: "exponential",
-      delay: 1000,
-    },
-    removeOnComplete: true,
-    timeout: 30000,
-  },
-  limiter: {
-    max: 50,
-    duration: 1000,
-  },
+centroidPool.on('error', (err) => {
+  candlesLogger.error(`Unexpected error on idle client: ${err.message}`, err.stack);
 });
 
 let availableCurrencyPairs: CurrencyPairInfo[] = [];
 const subscribedPairs: Set<string> = new Set();
 
 async function pgListener() {
-  const client = await centroidPool.connect();
-  // console.log("Connected to Centroid PostgreSQL for notifications");
+  let client;
+  try {
+    client = await centroidPool.connect();
+    candlesLogger.info("Connected to Centroid PostgreSQL for notifications");
 
-  client.on("notification", async (msg) => {
-    if (msg.channel === 'tick') {
-      try {
-        // candlesLogger.info(`Received notification from Centroid: ${msg.payload}`);       
-        const [symbol, lotsStr, bora, priceStr, timestampStr] = (msg.payload ?? "").split(" ");
-        const lots = parseInt(lotsStr);
-        const price = parseFloat(priceStr);
-        const timestamp = new Date(parseInt(timestampStr));
+    client.on("notification", async (msg) => {
+      if (msg.channel === 'tick') {
+        try {
+          const [symbol, lotsStr, bora, priceStr, timestampStr] = (msg.payload ?? "").split(" ");
+          const lots = parseInt(lotsStr);
+          const price = parseFloat(priceStr);
+          const timestamp = new Date(parseInt(timestampStr));
 
-        if (isNaN(timestamp.getTime())) {
-          candlesLogger.error(`Invalid timestamp received ----", ${timestampStr}`)
-          console.error("Invalid timestamp received ----", timestampStr);
-          return;
+          if (isNaN(timestamp.getTime())) {
+            candlesLogger.error(`Invalid timestamp received: ${timestampStr}`);
+            return;
+          }
+
+          if (isNaN(lots) || isNaN(price)) {
+            candlesLogger.error("Invalid data in notification:", { lots, price });
+            return;
+          }
+
+          const tickData: TickData = {
+            symbol,
+            price,
+            timestamp,
+            lots,
+            type: bora === "A" ? "ASK" : "BID"
+          };
+
+          await tickQueue.add('processTick', tickData, {
+            attempts: 3,
+            backoff: {
+              type: 'exponential',
+              delay: 1000,
+            },
+          });
+
+        } catch (error: any) {
+          candlesLogger.error("Error parsing notification payload from Centroid:", error);
         }
-
-        if (isNaN(lots) || isNaN(price)) {
-          console.error("Invalid data in notification:", { lots, price });
-          return;
-        }
-
-        const tickData: TickData = {
-          symbol,
-          price,
-          timestamp,
-          lots,
-          type: bora === "A" ? "ASK" : "BID"
-        };
-
-        // candlesLogger.info(`Processing tick data from Centroid: ${JSON.stringify(tickData)}`);
-        processMarketData(tickData);
-      } catch (error: any) {
-        console.error("Error parsing notification payload from Centroid:", error);
-        return;
       }
-    }
-  });
+    });
 
-  await client.query("LISTEN tick");
-  // console.log("Listening for notifications on Centroid channel 'tick'...");
-}
+    client.on('error', (err) => {
+      candlesLogger.error("PostgreSQL client error:", err);
+    });
 
-function processMarketData(data: TickData) {
-  marketDataQueue.add(data)
+    await client.query("LISTEN tick");
+
+  } catch (error: any) {
+    candlesLogger.error(`Connection failed: ${error.message}`);
+    throw error;
+  }
 }
 
 async function initDatabase() {
@@ -159,18 +128,18 @@ async function initDatabase() {
 }
 
 async function fetchAllCurrencyPairs() {
+  let client;
   try {
-    const result = await centroidPool.query(
+    client = await centroidPool.connect();
+    const result = await client.query(
       "SELECT currpair, contractsize FROM currpairdetails"
     );
     availableCurrencyPairs = result.rows;
-    // console.log(`Found ${availableCurrencyPairs.length} currency pairs in Lppime`);
     candlesLogger.info(`Found ${availableCurrencyPairs.length} currency pairs in Lppime`);
 
     const validPairs = availableCurrencyPairs.filter(
       (pair) => pair.contractsize !== null
     );
-    // console.log(`Found ${validPairs.length} valid pairs with contract size`);
     candlesLogger.info(`Found ${validPairs.length} valid pairs with contract size`);
 
     validPairs.forEach((pair) => {
@@ -189,12 +158,18 @@ async function fetchAllCurrencyPairs() {
   } catch (error) {
     console.error("Error fetching currency pairs from Lppime:", error);
     throw error;
+  } finally {
+    if (client) {
+      await client.release();
+    }
   }
 }
 
 async function ensureTableExists(tableName: string): Promise<void> {
+  let client;
   try {
-    const tableCheck = await centroidPool.query(
+    client = await centroidPool.connect();
+    const tableCheck = await client.query(
       `SELECT EXISTS (
         SELECT FROM information_schema.tables
         WHERE table_schema = 'public'
@@ -204,26 +179,32 @@ async function ensureTableExists(tableName: string): Promise<void> {
     );
 
     if (!tableCheck.rows[0].exists) {
-      await centroidPool.query(`
+      await client.query(`
         CREATE TABLE ${tableName} (
           ticktime TIMESTAMP WITH TIME ZONE NOT NULL,
-          lots INTEGER,
+          lots INTEGER NOT NULL,
           price NUMERIC NOT NULL,
           PRIMARY KEY (lots, ticktime)
         )
       `);
       candlesLogger.info(`Created table ${tableName} in Lppime`);
-      // console.log(`Created table ${tableName} in Lppime`);
     }
   } catch (error) {
     console.error(`Error ensuring table ${tableName} exists in Lppime:`, error);
+    candlesLogger.error(`Error ensuring table ${tableName} exists in Lppime:`, error);
     throw error;
+  } finally {
+    if (client) {
+      await client.release();
+    }
   }
 }
 
 async function ensureCandleTableExists(tableName: string): Promise<void> {
+  let client;
   try {
-    const tableCheck = await centroidPool.query(
+    client = await centroidPool.connect();
+    const tableCheck = await client.query(
       `SELECT EXISTS (
         SELECT FROM information_schema.tables
         WHERE table_schema = 'public'
@@ -233,7 +214,7 @@ async function ensureCandleTableExists(tableName: string): Promise<void> {
     );
 
     if (!tableCheck.rows[0].exists) {
-      await centroidPool.query(`
+      await client.query(`
         CREATE TABLE ${tableName} (
           candlesize TEXT NOT NULL,
           lots SMALLINT NOT NULL,
@@ -246,230 +227,27 @@ async function ensureCandleTableExists(tableName: string): Promise<void> {
         )
       `);
       candlesLogger.info(`Created candle table ${tableName} in Lppime`);
-      // console.log(`Created candle table ${tableName} in Lppime`);
     }
   } catch (error) {
     console.error(`Error ensuring candle table ${tableName} exists in Lppime:`, error);
+    candlesLogger.error(`Error ensuring candle table ${tableName} exists in Lppime:`, error);
     throw error;
+  } finally {
+    if (client) {
+      await client.release();
+    }
   }
 }
-
-marketDataQueue.process(5, async (job) => {
-  try {
-    const data = job.data;
-
-    if (!data.symbol || !data.price || !data.lots) {
-      throw new Error(`Invalid market data: ${JSON.stringify(data)}`);
-    }
-
-    let lots = parseInt(data.lots.toString());
-    let ticktime: Date;
-
-    if (data.timestamp instanceof Date) {
-      ticktime = data.timestamp;
-    } else if (data.timestamp) {
-      ticktime = new Date(data.timestamp);
-    } else {
-      ticktime = new Date();
-    }
-
-    if (isNaN(ticktime.getTime())) {
-      throw new Error(`Invalid timestamp received: ${data.timestamp}`);
-    }
-
-    let tableName: string;
-    const symbolLower = data.symbol.toLowerCase();
-
-    if (data.type === "BID") {
-      tableName = `ticks_${symbolLower}_bid`;
-    } else {
-      tableName = `ticks_${symbolLower}_ask`;
-    }
-
-
-    const insertQuery = await centroidPool.query({
-      text: `
-        INSERT INTO ${tableName} 
-        (ticktime, lots, price)
-        VALUES ($1, $2, $3)
-
-      `,
-      values: [
-        ticktime.toISOString(),
-        lots,
-        parseFloat(data.price.toString())
-      ],
-    });
-
-    if (insertQuery.rowCount !== null && insertQuery.rowCount > 0) {
-      candlesLogger.info(`Successfully inserted tick for ${data.symbol} into Lppime ${tableName}`);
-      // console.log(`Successfully inserted tick for ${data.symbol} into Lppime ${tableName}`);
-    } else {
-      candlesLogger.info(`Tick for ${data.symbol} with lots ${lots} already exists in Lppime ${tableName}`);
-      // console.log(`Tick for ${data.symbol} with lots ${lots} already exists in Lppime ${tableName}`);
-    }
-
-    if (data.type === "BID") {
-      await processTickForCandles({
-        symbol: data.symbol,
-        price: data.price,
-        timestamp: ticktime,
-        lots: lots,
-        type: data.type
-      });
-    }
-
-    return { success: true, symbol: data.symbol, type: data.type };
-  } catch (error) {
-    console.error(`Error processing market data job ${job.id} for ${job.data?.symbol}:`, error);
-    throw error;
-  }
-});
-
-async function processTickForCandles(tickData: TickData) {
-  try {
-    const jobId = `candle_${tickData.symbol}_${Date.now()}`;
-
-    await candleProcessingQueue.add(
-      {
-        tickData,
-        timeFrames: timeFrames,
-      },
-      {
-        jobId,
-      }
-    );
-  } catch (error) {
-    console.error("Error adding tick to candle processing queue:", error);
-    throw error;
-  }
-}
-
-candleProcessingQueue.process(async (job) => {
-  const { tickData, timeFrames } = job.data;
-  const { symbol, price, timestamp } = tickData;
-
-  if (!tickData || !timeFrames || !symbol || !price || timestamp == null) {
-    candlesLogger.error(`Incomplete job data: ${JSON.stringify(job.data)}`);
-    throw new Error("Invalid job data");
-  }
-
-  const lots = 1;
-  const tableName = `candles_${symbol.toLowerCase()}_bid`;
-
-  await ensureCandleTableExists(tableName);
-
-  let processedTimestamp: Date;
-
-  if (timestamp instanceof Date && !isNaN(timestamp.getTime())) {
-    processedTimestamp = timestamp;
-  } else if (typeof timestamp === 'string' || typeof timestamp === 'number') {
-    processedTimestamp = new Date(timestamp);
-    if (isNaN(processedTimestamp.getTime())) {
-      const numTimestamp = Number(timestamp);
-      processedTimestamp = new Date(
-        numTimestamp > 1000000000000 ? numTimestamp : numTimestamp * 1000
-      );
-    }
-  } else {
-    processedTimestamp = new Date();
-  }
-
-  if (isNaN(processedTimestamp.getTime())) {
-    processedTimestamp = new Date();
-  }
-
-  // Process each timeframe
-  for (const timeframe of Object.keys(timeFrames)) {
-    try {
-      const duration = timeFrames[timeframe];
-
-      if (!duration || isNaN(duration) || duration <= 0) {
-        candlesLogger.error(`Invalid duration ${duration} for timeframe ${timeframe}`);
-        continue;
-      }
-
-      const candleTime = new Date(
-        Math.floor(processedTimestamp.getTime() / duration) * duration
-      );
-
-      if (isNaN(candleTime.getTime())) {
-        throw new Error(`Invalid candle time calculation for ${symbol} ${timeframe}`);
-      }
-
-      // Check if candle exists
-      const existingCandle = await centroidPool.query({
-        text: `
-          SELECT * FROM ${tableName}
-          WHERE candlesize = $1 AND lots = $2 AND candletime = $3
-        `,
-        values: [timeframe, lots, candleTime.toISOString()],
-      });
-
-      if (existingCandle.rows.length > 0) {
-        // Update existing candle
-        const updateResult = await centroidPool.query({
-          text: `
-            UPDATE ${tableName}
-            SET high = GREATEST(high, $1),
-                low = LEAST(low, $2),
-                close = $3
-            WHERE candlesize = $4
-            AND lots = $5
-            AND candletime = $6
-            RETURNING *
-          `,
-          values: [
-            price,
-            price,
-            price,
-            timeframe,
-            lots,
-            candleTime.toISOString(),
-          ],
-        });
-        candlesLogger.info(`Updated candle for ${symbol} in ${timeframe}`, updateResult.rows[0]);
-      } else {
-        // Create new candle
-        const insertResult = await centroidPool.query({
-          text: `
-            INSERT INTO ${tableName}
-            (candlesize, lots, candletime, open, high, low, close)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING *
-          `,
-          values: [
-            timeframe,
-            lots,
-            candleTime.toISOString(),
-            price, // open
-            price, // high
-            price, // low
-            price, // close
-          ],
-        });
-        candlesLogger.info(`Created new candle for ${symbol} in ${timeframe}`, insertResult.rows[0]);
-      }
-    } catch (error) {
-      console.error(`Error processing ${timeframe} candle for ${symbol}:`, error);
-      throw error;
-    }
-  }
-
-  return { success: true, symbol };
-});
 
 async function initializeApplication() {
   try {
-    candlesLogger.info('Starting Candles Server with dual database setup...');
-    console.log('Starting Candles Server with dual database setup...');
-
-    await marketDataQueue.empty();
-    await candleProcessingQueue.empty();
+    candlesLogger.info('Starting Candles Server...');
+    console.log('Starting Candles Server...');
 
     await initDatabase();
-
     await pgListener();
+
+    console.log('Application initialized. Waiting for ticks...');
 
   } catch (error) {
     console.error("Application initialization failed:", error);
@@ -477,30 +255,16 @@ async function initializeApplication() {
   }
 }
 
-marketDataQueue.on("completed", (job, result) => {
-  // console.log(`MarketData Job ${job.id} completed: ${result.symbol} ${result.type}`);
-});
-
-marketDataQueue.on("failed", (job, error) => {
-  console.error(`MarketData Job ${job.id} failed:`, error);
-});
-
-candleProcessingQueue.on("completed", (job, result) => {
-  // console.log(`CandleProcessing Job ${job.id} completed for ${result.symbol}`);
-});
-
-candleProcessingQueue.on("failed", (job, error) => {
-  console.error(`CandleProcessing Job ${job.id} failed:`, error);
-});
-
 process.on("SIGINT", async () => {
   console.log("Shutting down gracefully...");
+  isShuttingDown = true;
 
   try {
-    await marketDataQueue.close();
-    await candleProcessingQueue.close();
-
+    await tickQueue.close();
+    await candleQueue.close();
+    await redisConnection.quit();
     await centroidPool.end();
+    console.log("Resources closed successfully");
     process.exit(0);
   } catch (error) {
     console.error("Error during shutdown:", error);

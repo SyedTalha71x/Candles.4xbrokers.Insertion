@@ -4,9 +4,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node dist/index.js",
-    "fix": "ts-node ./src/FixClient.ts",
-    "market": "ts-node ./src/MarketData.ts",
     "dev": "nodemon --exec ts-node index.ts --signal SIGKILL",
+    "worker": "ts-node worker.ts",
+    "worker-start": "node dist/worker.js",
     "build": "tsc"
   },
   "keywords": [],
@@ -15,18 +15,15 @@
   "description": "",
   "dependencies": {
     "@types/socket.io": "^3.0.1",
-    "bull": "^4.16.5",
+    "bullmq": "^5.51.0",
     "chalk": "^5.4.1",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "ioredis": "^5.6.1",
     "nodemon": "^3.1.9",
     "pg": "^8.13.3",
-    "redis": "^4.7.0",
-    "socket.io": "^4.8.1",
-    "socket.io-client": "^4.8.1",
     "uuid": "^11.1.0",
-    "winston": "^3.17.0",
-    "ws": "^8.18.1"
+    "winston": "^3.17.0"
   },
   "devDependencies": {
     "@types/chalk": "^0.4.31",
